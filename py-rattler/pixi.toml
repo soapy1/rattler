@@ -42,6 +42,7 @@ nushell = ">=0.106.1"
 pytest = ">=8.4.1,<9"
 pytest-asyncio = ">=1.0.0,<2"
 pytest-xprocess = ">=1.0.2,<2"
+pytest-benchmark = ">=5.2.3,<6"
 
 # used in examples
 typer = "*"
@@ -50,7 +51,8 @@ rust = "~=1.95.0"
 rust-src = "~=1.95.0"
 
 [feature.test.tasks]
-test = "pytest --doctest-modules --ignore=rattler/pty/pty_process.py --ignore=rattler/pty/pty_session.py"
+test = "pytest --doctest-modules --ignore=rattler/pty/pty_process.py --ignore=rattler/pty/pty_session.py --benchmark-disable"
+benchmark = "pytest --benchmark-only --benchmark-enable --benchmark-disable-gc"
 fmt-python = "ruff format rattler examples tests"
 fmt-rust = "cargo fmt --all"
 lint-python = "ruff check ."
