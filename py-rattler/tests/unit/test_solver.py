@@ -1,7 +1,9 @@
+import asyncio
 import datetime
 import os
 
 import pytest
+from pytest_benchmark.fixture import BenchmarkFixture
 
 from rattler import (
     solve,
@@ -374,3 +376,120 @@ async def test_solve_with_sparse_repodata_with_wheels() -> None:
     # solve needs to include these two packages
     assert "starlette" in package_names
     assert "python" in package_names
+
+
+def test_solve_accepts_sparse_repodata_as_source_benchmark_small(benchmark: BenchmarkFixture) -> None:
+    linux64_chan = Channel("conda-forge")
+    data_dir = os.path.join(os.path.dirname(__file__), "../../../test-data/")
+    linux64_path = os.path.join(data_dir, "channels/dummy/linux-64/repodata.json")
+    linux64_data = SparseRepoData(
+        channel=linux64_chan,
+        subdir="linux-64",
+        path=linux64_path,
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        def run() -> list[RepoDataRecord]:
+            return loop.run_until_complete(
+                solve(
+                    [linux64_data],
+                    ["foobar"],
+                    platforms=["linux-64"],
+                )
+            )
+
+        solved_data = benchmark.pedantic(run, rounds=100, warmup_rounds=5)
+    finally:
+        loop.close()
+
+    assert isinstance(solved_data, list)
+    assert isinstance(solved_data[0], RepoDataRecord)
+
+
+def test_solve_accepts_sparse_repodata_as_source_benchmark_big(benchmark: BenchmarkFixture) -> None:
+    linux64_chan = Channel("conda-forge")
+    data_dir = os.path.join(os.path.dirname(__file__), "../../../test-data/")
+    linux64_path = os.path.join(data_dir, "channels/big-sparse-repodata/linux-64/repodata.json")
+    linux64_data = SparseRepoData(
+        channel=linux64_chan,
+        subdir="linux-64",
+        path=linux64_path,
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        def run() -> list[RepoDataRecord]:
+            return loop.run_until_complete(
+                solve(
+                    [linux64_data],
+                    ["python"],
+                    platforms=["linux-64"],
+                )
+            )
+
+        solved_data = benchmark.pedantic(run, rounds=100, warmup_rounds=5)
+    finally:
+        loop.close()
+
+    assert isinstance(solved_data, list)
+    assert isinstance(solved_data[0], RepoDataRecord)
+    # assert len(solved_data) == 2
+
+
+def test_solve_with_sparse_repodata_benchmark_small(benchmark: BenchmarkFixture) -> None:
+    linux64_chan = Channel("conda-forge")
+    data_dir = os.path.join(os.path.dirname(__file__), "../../../test-data/")
+    linux64_path = os.path.join(data_dir, "channels/dummy/linux-64/repodata.json")
+    linux64_data = SparseRepoData(
+        channel=linux64_chan,
+        subdir="linux-64",
+        path=linux64_path,
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        def run() -> list[RepoDataRecord]:
+            return loop.run_until_complete(
+                solve_with_sparse_repodata(
+                    ["foobar"],
+                    [linux64_data],
+                )
+            )
+
+        solved_data = benchmark.pedantic(run, rounds=100, warmup_rounds=5)
+    finally:
+        loop.close()
+
+    assert isinstance(solved_data, list)
+    assert isinstance(solved_data[0], RepoDataRecord)
+    # assert len(solved_data) == 2
+
+
+def test_solve_with_sparse_repodata_benchmark_big(benchmark: BenchmarkFixture) -> None:
+    linux64_chan = Channel("conda-forge")
+    data_dir = os.path.join(os.path.dirname(__file__), "../../../test-data/")
+    linux64_path = os.path.join(data_dir, "channels/big-sparse-repodata/linux-64/repodata.json")
+    linux64_data = SparseRepoData(
+        channel=linux64_chan,
+        subdir="linux-64",
+        path=linux64_path,
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        def run() -> list[RepoDataRecord]:
+            return loop.run_until_complete(
+                solve_with_sparse_repodata(
+                    ["python"],
+                    [linux64_data],
+                )
+            )
+
+        solved_data = benchmark.pedantic(run, rounds=100, warmup_rounds=5)
+    finally:
+        loop.close()
+
+    assert isinstance(solved_data, list)
+    assert isinstance(solved_data[0], RepoDataRecord)
+    # assert len(solved_data) == 2
