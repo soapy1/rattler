@@ -75,6 +75,45 @@ class SparseRepoData:
             )
         self._sparse = PySparseRepoData(channel._channel, subdir, str(path))
 
+    @classmethod
+    def from_bytes(cls, channel: Channel, subdir: str, data: bytes) -> SparseRepoData:
+        """
+        Constructs a new instance directly from the raw bytes of a
+        `repodata.json` file, without reading it from the filesystem. This is
+        useful if the repodata is already available in memory, e.g. because
+        it was just downloaded.
+
+        Examples
+        --------
+        ```python
+        >>> from rattler import Channel, ChannelConfig
+        >>> channel = Channel("dummy", ChannelConfig())
+        >>> path = "../test-data/channels/dummy/linux-64/repodata.json"
+        >>> with open(path, "rb") as f:
+        ...     data = f.read()
+        >>> sparse_data = SparseRepoData.from_bytes(channel, "linux-64", data)
+        >>> sparse_data.subdir
+        'linux-64'
+        >>>
+        ```
+        """
+        if not isinstance(channel, Channel):
+            raise TypeError(
+                "SparseRepoData.from_bytes received unsupported type "
+                f" {type(channel).__name__!r} for the `channel` parameter"
+            )
+        if not isinstance(subdir, str):
+            raise TypeError(
+                "SparseRepoData.from_bytes received unsupported type "
+                f" {type(subdir).__name__!r} for the `subdir` parameter"
+            )
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "SparseRepoData.from_bytes received unsupported type "
+                f" {type(data).__name__!r} for the `data` parameter"
+            )
+        return cls._from_py_sparse_repo_data(PySparseRepoData.from_bytes(channel._channel, subdir, data))
+
     def close(self) -> None:
         """
         Closes any mapped resources associated with this `SparseRepoData`

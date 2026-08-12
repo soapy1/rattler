@@ -3635,6 +3635,7 @@ dependencies = [
  "astral-reqwest-middleware",
  "astral-reqwest-retry",
  "async-trait",
+ "bytes",
  "futures",
  "http 1.4.2",
  "jiff",

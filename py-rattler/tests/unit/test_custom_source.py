@@ -2,7 +2,11 @@
 
 from typing import Any, List
 
+import asyncio
 import pytest
+import functools
+
+from pytest_benchmark.fixture import BenchmarkFixture
 
 from rattler import (
     Channel,
@@ -298,6 +302,81 @@ async def test_custom_source_backed_by_sparse_repodata() -> None:
 
     # Snapshot of solved packages with subdir prefix
     solved_snapshot = sorted(f"{r.subdir}/{r.name.normalized}-{r.version}-{r.build}" for r in solved)
+    assert solved_snapshot == [
+        "linux-64/bors-1.2.1-bla_1",
+        "linux-64/foobar-2.1-bla_1",
+    ]
+
+def test_custom_source_backed_by_sparse_repodata_benchmark_small(benchmark: BenchmarkFixture) -> None:
+    """Test a custom RepoDataSource that wraps SparseRepoData.
+
+    This demonstrates how to create a custom source that loads records
+    from local repodata files, which can be useful for offline scenarios
+    or when you want to filter/transform repodata before solving.
+    """
+    import os
+
+    from rattler import SparseRepoData
+
+    # Load sparse repodata from the test data directory
+    data_dir = os.path.join(os.path.dirname(__file__), "../../../test-data/")
+    linux64_path = os.path.join(data_dir, "channels/dummy/linux-64/repodata.json")
+
+    class SparseRepoDataSource(RepoDataSource):
+        """A custom source that wraps SparseRepoData files."""
+
+        def __init__(self, repodata_by_platform: dict[str, SparseRepoData]):
+            self._repodata = repodata_by_platform
+
+        # Not sure if caching here is always safe. For the purpose of benchmarking, this will 
+        # give this implementation the best chance at being the most performant.
+        @functools.cache
+        def _load_records(self, platform_str: str, name_str: str) -> List[RepoDataRecord]:
+            if platform_str in self._repodata:
+                return self._repodata[platform_str].load_records(PackageName(name_str))
+            return []
+
+        async def fetch_package_records(self, platform: Platform, name: PackageName) -> List[RepoDataRecord]:
+            return self._load_records(str(platform), name.normalized)
+
+        @functools.cache
+        def package_names(self, platform: Platform) -> List[str]:
+            platform_str = str(platform)
+            if platform_str in self._repodata:
+                return self._repodata[platform_str].package_names()
+            return []
+
+    # Create sparse repodata for linux-64
+    linux64_data = SparseRepoData(
+        channel=Channel("dummy"),
+        subdir="linux-64",
+        path=linux64_path,
+    )
+
+    # Wrap in our custom source
+    source = SparseRepoDataSource({"linux-64": linux64_data})
+
+    loop = asyncio.new_event_loop()
+    try:
+        def run() -> list[RepoDataRecord]:
+            return loop.run_until_complete(
+                solve(
+                    sources=[source],
+                    specs=["foobar"],
+                    platforms=["linux-64"],
+                )
+            )
+
+        solved_data = benchmark.pedantic(run, rounds=100, warmup_rounds=5)  # type: ignore[no-untyped-call]
+    finally:
+        loop.close()
+
+    assert isinstance(solved_data, list)
+    assert isinstance(solved_data[0], RepoDataRecord)
+    assert len(solved_data) == 2
+
+    # Snapshot of solved packages with subdir prefix
+    solved_snapshot = sorted(f"{r.subdir}/{r.name.normalized}-{r.version}-{r.build}" for r in solved_data)
     assert solved_snapshot == [
         "linux-64/bors-1.2.1-bla_1",
         "linux-64/foobar-2.1-bla_1",

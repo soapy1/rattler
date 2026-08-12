@@ -1,5 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 
+use bytes::Bytes;
 use pyo3::{Bound, PyRef, PyResult, Python, pyclass, pymethods};
 
 use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
@@ -22,10 +23,13 @@ pub struct PySparseRepoData {
     // in a RwLock because most of the time we just want to be able to read from it. We only
     // need write access to close it.
     //
-    // This whole thing is then wrapped in an Arc so we can share this with a background thread
-    // without blocking the GIL.
-    pub(crate) inner: Arc<RwLock<Option<SparseRepoData>>>,
-    subdir: String,
+    // The `SparseRepoData` itself is wrapped in an `Arc` too, so `as_source` can hand out a
+    // cheap clone of the *same* `Arc` on every call rather than re-parsing or copying data.
+    //
+    // This whole thing is then wrapped in an outer Arc so we can share this with a background
+    // thread without blocking the GIL.
+    pub(crate) inner: Arc<RwLock<Option<Arc<SparseRepoData>>>>,
+    pub(crate) subdir: String,
 }
 
 impl PySparseRepoData {
@@ -33,13 +37,43 @@ impl PySparseRepoData {
     pub(crate) fn from_args(channel: PyChannel, subdir: String, path: PathBuf) -> PyResult<Self> {
         Ok(SparseRepoData::from_file(channel.into(), subdir, path, None)?.into())
     }
+
+    /// Create a new instance from in-memory bytes without requiring the GIL.
+    /// This avoids the filesystem entirely, which is useful when the
+    /// repodata is already available in memory (e.g. freshly downloaded).
+    pub(crate) fn from_bytes_args(
+        channel: PyChannel,
+        subdir: String,
+        bytes: Bytes,
+    ) -> PyResult<Self> {
+        // `SparseRepoData::from_bytes` returns a `serde_json::Error`, which
+        // doesn't convert to `PyErr` directly. Route it through `io::Error`,
+        // just like `from_file` does internally, so parse failures surface
+        // the same way regardless of which constructor was used.
+        Ok(
+            SparseRepoData::from_bytes(channel.into(), subdir, bytes, None)
+                .map_err(io::Error::from)?
+                .into(),
+        )
+    }
+
+    /// Returns the underlying `SparseRepoData` so it can be passed directly
+    /// to `Gateway::query` as a `Source::SparseRepoData` (e.g. via `solve`'s
+    /// `sources` argument).
+    pub(crate) fn as_source(&self) -> PyResult<Arc<SparseRepoData>> {
+        self.inner
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PyValueError::new_err("I/O operation on closed file."))
+    }
 }
 
 impl From<SparseRepoData> for PySparseRepoData {
     fn from(value: SparseRepoData) -> Self {
         Self {
             subdir: value.subdir().to_owned(),
-            inner: Arc::new(RwLock::new(Some(value))),
+            inner: Arc::new(RwLock::new(Some(Arc::new(value)))),
         }
     }
 }
@@ -105,6 +139,18 @@ impl PySparseRepoData {
         path: PathBuf,
     ) -> PyResult<Self> {
         py.detach(move || Self::from_args(channel, subdir, path))
+    }
+
+    /// Construct an instance directly from in-memory repodata bytes, without
+    /// reading it from the filesystem.
+    #[staticmethod]
+    pub fn from_bytes(
+        py: Python<'_>,
+        channel: PyChannel,
+        subdir: String,
+        data: Vec<u8>,
+    ) -> PyResult<Self> {
+        py.detach(move || Self::from_bytes_args(channel, subdir, Bytes::from(data)))
     }
 
     pub fn package_names(
@@ -228,7 +274,7 @@ impl PySparseRepoData {
         let repo_data_refs = repo_data_locks
             .iter()
             .map(|s| {
-                s.as_ref()
+                s.as_deref()
                     .ok_or_else(|| PyValueError::new_err("I/O operation on closed file."))
             })
             .collect::<Result<Vec<_>, _>>()?;

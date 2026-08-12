@@ -25,6 +25,7 @@ pty = ["rattler_pty", "nix"]
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 jiff = { version = "0.2" }
 futures = "0.3"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
