@@ -1,5 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 
+use bytes::Bytes;
 use pyo3::{Bound, PyRef, PyResult, Python, pyclass, pymethods};
 
 use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
@@ -35,6 +36,25 @@ impl PySparseRepoData {
     /// Create a new instance without requiring the GIL.
     pub(crate) fn from_args(channel: PyChannel, subdir: String, path: PathBuf) -> PyResult<Self> {
         Ok(SparseRepoData::from_file(channel.into(), subdir, path, None)?.into())
+    }
+
+    /// Create a new instance from in-memory bytes without requiring the GIL.
+    /// This avoids the filesystem entirely, which is useful when the
+    /// repodata is already available in memory (e.g. freshly downloaded).
+    pub(crate) fn from_bytes_args(
+        channel: PyChannel,
+        subdir: String,
+        bytes: Bytes,
+    ) -> PyResult<Self> {
+        // `SparseRepoData::from_bytes` returns a `serde_json::Error`, which
+        // doesn't convert to `PyErr` directly. Route it through `io::Error`,
+        // just like `from_file` does internally, so parse failures surface
+        // the same way regardless of which constructor was used.
+        Ok(
+            SparseRepoData::from_bytes(channel.into(), subdir, bytes, None)
+                .map_err(io::Error::from)?
+                .into(),
+        )
     }
 
     /// Returns the underlying `SparseRepoData` so it can be passed directly
@@ -119,6 +139,18 @@ impl PySparseRepoData {
         path: PathBuf,
     ) -> PyResult<Self> {
         py.detach(move || Self::from_args(channel, subdir, path))
+    }
+
+    /// Construct an instance directly from in-memory repodata bytes, without
+    /// reading it from the filesystem.
+    #[staticmethod]
+    pub fn from_bytes(
+        py: Python<'_>,
+        channel: PyChannel,
+        subdir: String,
+        data: Vec<u8>,
+    ) -> PyResult<Self> {
+        py.detach(move || Self::from_bytes_args(channel, subdir, Bytes::from(data)))
     }
 
     pub fn package_names(
