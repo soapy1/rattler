@@ -45,6 +45,7 @@ pub(crate) fn empty_repodata_revisions() -> &'static RepodataRevisions {
     Copy,
     PartialEq,
     Eq,
+    Hash,
     strum::Display,
     strum::VariantNames,
     strum::EnumString,

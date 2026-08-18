@@ -23,6 +23,7 @@ mod warning;
 use std::{collections::HashSet, sync::Arc};
 
 use crate::reporter::report_unsupported_repodata_revisions;
+use crate::sparse::PackageFormatSelection;
 use crate::{Reporter, gateway::subdir_builder::SubdirBuilder};
 pub use barrier_cell::BarrierCell;
 pub use builder::{GatewayBuilder, MaxConcurrency};
@@ -219,7 +220,7 @@ impl Gateway {
     ) -> Result<Option<ChannelRelations>, GatewayError> {
         match self
             .inner
-            .get_or_create_subdir(channel, platform, None)
+            .get_or_create_subdir(channel, platform, PackageFormatSelection::default(), None)
             .await
         {
             Ok(subdir) => Ok(subdir.channel_relations().cloned()),
@@ -332,8 +333,9 @@ impl Gateway {
 }
 
 struct GatewayInner {
-    /// A map of subdirectories for each channel and platform.
-    subdirs: CoalescedMap<(Channel, Platform), Arc<Subdir>>,
+    /// A map of subdirectories for each channel, platform and package format
+    /// selection.
+    subdirs: CoalescedMap<(Channel, Platform, PackageFormatSelection), Arc<Subdir>>,
 
     /// The client to use to fetch repodata.
     client: LazyClient,
@@ -382,9 +384,10 @@ impl GatewayInner {
         &self,
         channel: &Channel,
         platform: Platform,
+        package_format_selection: PackageFormatSelection,
         reporter: Option<Arc<dyn Reporter>>,
     ) -> Result<Arc<Subdir>, GatewayError> {
-        let key = (channel.clone(), platform);
+        let key = (channel.clone(), platform, package_format_selection);
         let channel_for_create = channel.clone();
         let reporter_for_create = reporter.clone();
 
@@ -392,7 +395,12 @@ impl GatewayInner {
             .subdirs
             .get_or_try_init(key, || async move {
                 let subdir = self
-                    .create_subdir(&channel_for_create, platform, reporter_for_create)
+                    .create_subdir(
+                        &channel_for_create,
+                        platform,
+                        package_format_selection,
+                        reporter_for_create,
+                    )
                     .await?;
                 Ok(Arc::new(subdir))
             })
@@ -419,11 +427,18 @@ impl GatewayInner {
         &self,
         channel: &Channel,
         platform: Platform,
+        package_format_selection: PackageFormatSelection,
         reporter: Option<Arc<dyn Reporter>>,
     ) -> Result<Subdir, GatewayError> {
-        SubdirBuilder::new(self, channel.clone(), platform, reporter)
-            .build()
-            .await
+        SubdirBuilder::new(
+            self,
+            channel.clone(),
+            platform,
+            reporter,
+            package_format_selection,
+        )
+        .build()
+        .await
     }
 }
 

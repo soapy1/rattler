@@ -12,6 +12,7 @@ use crate::{
     gateway::{
         GatewayError, SourceConfig, error::SubdirNotFoundError, local_subdir::LocalSubdirClient,
     },
+    sparse::PackageFormatSelection,
 };
 
 pub struct RemoteSubdirClient {
@@ -25,6 +26,7 @@ impl RemoteSubdirClient {
         client: LazyClient,
         source_config: SourceConfig,
         reporter: Option<Arc<dyn Reporter>>,
+        package_format_selection: PackageFormatSelection,
     ) -> Result<Self, GatewayError> {
         let subdir_url = channel.platform_url(platform);
 
@@ -53,8 +55,12 @@ impl RemoteSubdirClient {
 
         // Create a new sparse repodata client that can be used to read records from the
         // repodata.
-        let sparse =
-            LocalSubdirClient::from_bytes(repodata_bytes, channel.clone(), platform.as_str())?;
+        let sparse = LocalSubdirClient::from_bytes(
+            repodata_bytes,
+            channel.clone(),
+            platform.as_str(),
+            package_format_selection,
+        )?;
 
         Ok(Self { sparse })
     }

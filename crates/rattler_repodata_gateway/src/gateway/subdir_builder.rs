@@ -14,6 +14,7 @@ use crate::{
         remote_subdir, sharded_subdir,
         subdir::{Subdir, SubdirData},
     },
+    sparse::PackageFormatSelection,
 };
 
 /// Builder for creating a `Subdir` instance.
@@ -22,6 +23,7 @@ pub struct SubdirBuilder<'g> {
     platform: Platform,
     reporter: Option<Arc<dyn Reporter>>,
     gateway: &'g GatewayInner,
+    package_format_selection: PackageFormatSelection,
 }
 
 impl<'g> SubdirBuilder<'g> {
@@ -30,12 +32,14 @@ impl<'g> SubdirBuilder<'g> {
         channel: Channel,
         platform: Platform,
         reporter: Option<Arc<dyn Reporter>>,
+        package_format_selection: PackageFormatSelection,
     ) -> Self {
         Self {
             channel,
             platform,
             reporter,
             gateway,
+            package_format_selection,
         }
     }
 
@@ -135,6 +139,7 @@ impl<'g> SubdirBuilder<'g> {
             self.gateway.cache.clone(),
             source_config.clone(),
             self.reporter.clone(),
+            self.package_format_selection,
         )
         .await?;
         Ok(SubdirData::from_client(client))
@@ -169,8 +174,15 @@ impl<'g> SubdirBuilder<'g> {
         let channel = self.channel.clone();
         let platform = self.platform;
         let path = path.join("repodata.json");
-        let build_client =
-            move || LocalSubdirClient::from_file(&path, channel.clone(), platform.as_str());
+        let package_format_selection = self.package_format_selection;
+        let build_client = move || {
+            LocalSubdirClient::from_file(
+                &path,
+                channel.clone(),
+                platform.as_str(),
+                package_format_selection,
+            )
+        };
 
         #[cfg(target_arch = "wasm32")]
         let client = build_client()?;
