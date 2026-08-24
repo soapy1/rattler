@@ -4,11 +4,9 @@ use std::{
 };
 
 use crate::{
-    Reporter,
-    fetch::{FetchRepoDataError, FetchRepoDataOptions, Variant, fetch_repo_data},
-    gateway::{
+    Reporter, fetch::{FetchRepoDataError, FetchRepoDataOptions, Variant, fetch_repo_data}, gateway::{
         GatewayError, SourceConfig, error::SubdirNotFoundError, local_subdir::LocalSubdirClient,
-    },
+    }, sparse::PackageFormatSelection,
 };
 use rattler_conda_types::{Channel, Platform};
 use rattler_networking::LazyClient;
@@ -60,6 +58,7 @@ impl RemoteSubdirClient {
                 &repodata.repo_data_json_path,
                 channel.clone(),
                 platform.as_str(),
+                PackageFormatSelection::default()
             )
         })
         .await?;

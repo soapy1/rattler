@@ -8,6 +8,7 @@ use futures::{FutureExt, StreamExt, select_biased, stream::FuturesUnordered};
 use rattler_conda_types::{
     Channel, ChannelUrl, MatchSpec, Matches, PackageName, PackageNameMatcher, Platform,
     RepoDataRecord,
+    package::{ArchiveIdentifier, CondaArchiveType, DistArchiveType},
 };
 use url::Url;
 
@@ -19,7 +20,7 @@ use super::{
     source::{CustomSourceClient, Source},
     subdir::{PackageRecords, Subdir, SubdirData, extract_unique_deps_split},
 };
-use crate::Reporter;
+use crate::{Reporter, sparse::PackageFormatSelection};
 
 type RecordPatch = dyn Fn(&RepoDataRecord) -> Option<RepoDataRecord> + Send + Sync;
 
@@ -153,6 +154,9 @@ pub struct RepoDataQuery {
 
     /// Maximum recursion depth when following CEP-42 `channel_relations`.
     channel_relations_max_depth: usize,
+
+    /// Defines which package formats are selected.
+    package_format_selection: PackageFormatSelection,
 }
 
 /// Tracks whether specs came from user input or transitive dependencies.
@@ -247,6 +251,7 @@ impl RepoDataQuery {
             channel_notices: false,
             channel_relations_mode: ChannelRelationsMode::default(),
             channel_relations_max_depth: DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH,
+            package_format_selection: PackageFormatSelection::default(),
         }
     }
 
@@ -306,6 +311,15 @@ impl RepoDataQuery {
     ) -> Self {
         Self {
             record_patch: Some(Arc::new(patch)),
+            ..self
+        }
+    }
+
+    /// Defines which package formats are selected.
+    #[must_use]
+    pub fn package_format_selection(self, package_format: PackageFormatSelection) -> Self {
+        Self {
+            package_format_selection: package_format,
             ..self
         }
     }
@@ -381,6 +395,9 @@ struct QueryExecutor {
 
     /// CEP-6 notice collection state.
     notices: NoticeCollector,
+
+    /// Defines which package formats are selected.
+    package_format_selection: PackageFormatSelection,
 }
 
 /// Collects CEP-6 notices while a query runs. Fetches are queued as channels
@@ -452,6 +469,7 @@ impl QueryExecutor {
             channel_notices,
             channel_relations_mode,
             channel_relations_max_depth,
+            package_format_selection,
         } = query;
 
         let mut seen = hashbrown::HashMap::with_hasher(ahash::RandomState::new());
@@ -583,7 +601,7 @@ impl QueryExecutor {
                         };
                         let subdir = match matching {
                             Some(sparse) => Arc::new(Subdir::Found(SubdirData::from_client(
-                                LocalSubdirClient::new(sparse),
+                                LocalSubdirClient::new(sparse, package_format_selection),
                             ))),
                             None => Arc::new(Subdir::NotFound),
                         };
@@ -629,6 +647,7 @@ impl QueryExecutor {
             pending_records: FuturesUnordered::new(),
             expander,
             notices,
+            package_format_selection,
         })
     }
 
@@ -1179,6 +1198,14 @@ impl QueryExecutor {
             repodata.push(d);
         }
         repodata.extend(handles.into_iter().map(|h| h.data));
+
+        for repo_data in &mut repodata {
+            repo_data.records = filter_records_by_package_format(
+                std::mem::take(&mut repo_data.records),
+                self.package_format_selection,
+            );
+        }
+
         Ok(RepoDataQueryOutput {
             repodata,
             notices: self.notices.collected,
@@ -1190,6 +1217,79 @@ impl QueryExecutor {
                 .collect(),
         })
     }
+}
+
+/// Filters and, where applicable, deduplicates `records` according to
+/// `selection`. Called once from [`QueryExecutor::finalize_channel_relations`]
+/// after every source (direct-URL result and each channel-relation subdir)
+/// has been fetched and merged, so the same package-format rules apply
+/// uniformly no matter which [`super::subdir::SubdirClient`] produced a
+/// given record.
+fn filter_records_by_package_format(
+    records: Vec<Arc<RepoDataRecord>>,
+    selection: PackageFormatSelection,
+) -> Vec<Arc<RepoDataRecord>> {
+    match selection {
+        PackageFormatSelection::Both => records,
+        PackageFormatSelection::OnlyTarBz2 => records
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.identifier.archive_type,
+                    DistArchiveType::Conda(CondaArchiveType::TarBz2)
+                )
+            })
+            .collect(),
+        PackageFormatSelection::OnlyConda => records
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.identifier.archive_type,
+                    DistArchiveType::Conda(CondaArchiveType::Conda)
+                )
+            })
+            .collect(),
+        PackageFormatSelection::PreferConda => dedup_records_by_preference(records, false),
+        PackageFormatSelection::PreferCondaWithWhl => dedup_records_by_preference(records, true),
+    }
+}
+
+/// Keeps, for each unique (name, version, build) archive identifier, only
+/// the most-preferred variant, per [`DistArchiveType::cmp_preference`]
+/// (`.conda` over `.tar.bz2` over `.whl`). When `include_whl` is `false`,
+/// `.whl` records are dropped outright rather than being allowed to win a
+/// group. The relative order of the surviving records is otherwise
+/// preserved.
+fn dedup_records_by_preference(
+    records: Vec<Arc<RepoDataRecord>>,
+    include_whl: bool,
+) -> Vec<Arc<RepoDataRecord>> {
+    let mut positions: std::collections::HashMap<ArchiveIdentifier, usize> =
+        std::collections::HashMap::new();
+    let mut out: Vec<Arc<RepoDataRecord>> = Vec::with_capacity(records.len());
+    for record in records {
+        if !include_whl && matches!(record.identifier.archive_type, DistArchiveType::Wheel(_)) {
+            continue;
+        }
+        match positions.entry(record.identifier.identifier.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let idx = *entry.get();
+                if record
+                    .identifier
+                    .archive_type
+                    .cmp_preference(out[idx].identifier.archive_type)
+                    == std::cmp::Ordering::Greater
+                {
+                    out[idx] = record;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(out.len());
+                out.push(record);
+            }
+        }
+    }
+    out
 }
 
 /// How a channel subdir fetch should handle errors from
