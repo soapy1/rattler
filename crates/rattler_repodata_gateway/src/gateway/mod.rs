@@ -1939,6 +1939,7 @@ mod test {
             &self,
             platform: Platform,
             name: &PackageName,
+            _package_format_selection: PackageFormatSelection,
         ) -> Result<Vec<Arc<RepoDataRecord>>, GatewayError> {
             let records = self
                 .records
@@ -2585,12 +2586,13 @@ mod test {
             &self,
             platform: Platform,
             name: &PackageName,
+            package_format_selection: PackageFormatSelection,
         ) -> Result<Vec<Arc<RepoDataRecord>>, GatewayError> {
             self.fetched
                 .lock()
                 .unwrap()
                 .push(name.as_normalized().to_string());
-            self.inner.fetch_package_records(platform, name).await
+            self.inner.fetch_package_records(platform, name, package_format_selection).await
         }
 
         fn package_names(&self, platform: Platform) -> Vec<String> {
