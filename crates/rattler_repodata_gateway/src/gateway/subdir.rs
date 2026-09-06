@@ -146,11 +146,7 @@ impl SubdirData {
         self.records
             .get_or_try_init(name.clone(), || async move {
                 client
-                    .fetch_package_records(
-                        &name_clone,
-                        reporter.as_deref(),
-                        package_format_selection,
-                    )
+                    .fetch_package_records(&name_clone, reporter.as_deref())
                     .await
             })
             .await
@@ -216,7 +212,6 @@ pub trait SubdirClient: Send + Sync {
         &self,
         name: &PackageName,
         reporter: Option<&dyn Reporter>,
-        package_format_selection: PackageFormatSelection,
     ) -> Result<PackageRecords, GatewayError>;
 
     /// Returns the names of all packages in the subdirectory.

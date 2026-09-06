@@ -19,7 +19,6 @@ use crate::{
         subdir::{PackageRecords, SubdirClient},
     },
     reporter::ResponseReporterExt,
-    sparse::PackageFormatSelection,
 };
 use fs_err::tokio as tokio_fs;
 use futures::future::OptionFuture;
@@ -196,7 +195,6 @@ impl SubdirClient for ShardedSubdir {
         &self,
         name: &PackageName,
         reporter: Option<&dyn Reporter>,
-        package_format_selection: PackageFormatSelection,
     ) -> Result<PackageRecords, GatewayError> {
         // Find the shard that contains the package
         let Some(shard) = self.sharded_repodata.shards.get(name.as_normalized()) else {
@@ -226,7 +224,6 @@ impl SubdirClient for ShardedSubdir {
                         cached_bytes,
                         self.channel.base_url.clone(),
                         self.package_base_url.clone(),
-                        package_format_selection,
                     )
                     .await;
                 }
@@ -305,7 +302,6 @@ impl SubdirClient for ShardedSubdir {
             shard_bytes,
             self.channel.base_url.clone(),
             self.package_base_url.clone(),
-            package_format_selection,
         );
 
         // Await both futures concurrently.

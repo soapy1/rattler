@@ -181,79 +181,80 @@ fn dedup_by_preference(
     out
 }
 
-/// Deserializes raw shard bytes into a [`Shard`].
-fn load_shard<R: AsRef<[u8]>>(bytes: R) -> Result<Shard, GatewayError> {
-    rmp_serde::from_slice::<Shard>(bytes.as_ref())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
-        .map_err(FetchRepoDataError::IoError)
-        .map_err(GatewayError::from)
-}
+async fn parse_records<R: AsRef<[u8]> + Send + 'static>(
+    bytes: R,
+    channel_base_url: ChannelUrl,
+    base_url: Url,
+) -> Result<PackageRecords, GatewayError> {
+    let parse =
+        move || {
+            let shard = rmp_serde::from_slice::<Shard>(bytes.as_ref())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+                .map_err(FetchRepoDataError::IoError)?;
 
-/// Converts a [`Shard`] into [`PackageRecords`], applying `variant_consolidation`
-/// to select and deduplicate the package format variants exposed to the solver.
-fn get_records(
-    shard: Shard,
-    channel_base_url: &ChannelUrl,
-    base_url: &Url,
-    variant_consolidation: PackageFormatSelection,
-) -> PackageRecords {
-    let channel_str = channel_base_url.url().clone().redact().to_string();
-    let base_url_str = base_url.as_str();
-    let records: Vec<Arc<RepoDataRecord>> = select_shard_records(shard, variant_consolidation)
-        .map(|(file_name, raw_record)| match raw_record {
-            RawShardRecord::Package(package_record) => {
-                let file_name_str = file_name.to_file_name();
-                Arc::new(RepoDataRecord {
-                    url: Url::parse(&format!("{base_url_str}{file_name_str}"))
-                        .expect("filename is not a valid url"),
-                    channel: Some(channel_str.clone()),
-                    package_record,
-                    identifier: file_name,
+            // Chain v3 tar.bz2/conda packages into the main iteration
+            let v3_tar_bz2 = shard.v3.tar_bz2.into_iter().map(|(id, rec)| {
+                (
+                    DistArchiveIdentifier::new(id, CondaArchiveType::TarBz2),
+                    rec,
+                )
+            });
+            let v3_conda =
+                shard.v3.conda.into_iter().map(|(id, rec)| {
+                    (DistArchiveIdentifier::new(id, CondaArchiveType::Conda), rec)
+                });
+
+            let packages = itertools::chain(shard.packages, shard.conda_packages)
+                .chain(v3_tar_bz2)
+                .chain(v3_conda)
+                .filter(|(name, _record)| !shard.removed.contains(name));
+
+            let channel_str = channel_base_url.url().clone().redact().to_string();
+            let base_url_str = base_url.as_str();
+            let mut records: Vec<Arc<RepoDataRecord>> = packages
+                .map(|(file_name, package_record)| {
+                    let file_name_str = file_name.to_file_name();
+                    Arc::new(RepoDataRecord {
+                        url: Url::parse(&format!("{base_url_str}{file_name_str}"))
+                            .expect("filename is not a valid url"),
+                        channel: Some(channel_str.clone()),
+                        package_record,
+                        identifier: file_name,
+                    })
                 })
-            }
-            RawShardRecord::Whl(WhlPackageRecord {
-                url,
-                package_record,
-            }) => {
+                .collect();
+
+            // Handle v3 whl packages separately (different URL resolution)
+            for (
+                id,
+                WhlPackageRecord {
+                    url,
+                    package_record,
+                },
+            ) in shard.v3.whl
+            {
+                let dist_id = DistArchiveIdentifier::new(id, WheelArchiveType::Whl);
                 let url = match url {
                     UrlOrPath::Path(path) => Url::parse(&format!("{base_url_str}{path}"))
                         .expect("path is not a valid url"),
                     UrlOrPath::Url(url) => url,
                 };
-                Arc::new(RepoDataRecord {
+                records.push(Arc::new(RepoDataRecord {
                     url,
                     channel: Some(channel_str.clone()),
                     package_record,
-                    identifier: file_name,
-                })
+                    identifier: dist_id,
+                }));
             }
-        })
-        .collect();
 
-    let (unique_base_deps, unique_extra_deps) =
-        extract_unique_deps_split(records.iter().map(|r| &**r));
-    PackageRecords {
-        records,
-        unique_base_deps,
-        unique_extra_deps,
-    }
-}
-
-async fn parse_records<R: AsRef<[u8]> + Send + 'static>(
-    bytes: R,
-    channel_base_url: ChannelUrl,
-    base_url: Url,
-    variant_consolidation: PackageFormatSelection,
-) -> Result<PackageRecords, GatewayError> {
-    let parse = move || {
-        let shard = load_shard(bytes)?;
-        Ok(get_records(
-            shard,
-            &channel_base_url,
-            &base_url,
-            variant_consolidation,
-        ))
-    };
+            let (unique_base_deps, unique_extra_deps) =
+                extract_unique_deps_split(records.iter().map(|r| &**r));
+            Ok(PackageRecords {
+                records,
+                unique_base_deps,
+                unique_extra_deps,
+            })
+        };
 
     #[cfg(target_arch = "wasm32")]
     return parse();
@@ -524,9 +525,7 @@ mod tests {
         .unwrap();
 
         let package_name = "test-package".parse().unwrap();
-        let result = subdir
-            .fetch_package_records(&package_name, None, PackageFormatSelection::default())
-            .await;
+        let result = subdir.fetch_package_records(&package_name, None).await;
 
         let err = result.expect_err("should fail with empty response");
         let err_string = err.to_string();
@@ -637,9 +636,7 @@ mod tests {
         .unwrap();
 
         let package_name = "test-package".parse().unwrap();
-        let result = subdir
-            .fetch_package_records(&package_name, None, PackageFormatSelection::default())
-            .await;
+        let result = subdir.fetch_package_records(&package_name, None).await;
 
         let err = result.expect_err("should fail with truncated response");
         let err_string = err.to_string();
@@ -748,11 +745,7 @@ mod tests {
                 cache_only_subdir_with_cold_shard(cache_dir.path(), &server, action, false).await;
 
             let err = subdir
-                .fetch_package_records(
-                    &"test-package".parse().unwrap(),
-                    None,
-                    PackageFormatSelection::default(),
-                )
+                .fetch_package_records(&"test-package".parse().unwrap(), None)
                 .await
                 .expect_err("a cold shard fails a cache-only query");
 
@@ -782,11 +775,7 @@ mod tests {
                 cache_only_subdir_with_cold_shard(cache_dir.path(), &server, action, true).await;
 
             let records = subdir
-                .fetch_package_records(
-                    &"test-package".parse().unwrap(),
-                    None,
-                    PackageFormatSelection::default(),
-                )
+                .fetch_package_records(&"test-package".parse().unwrap(), None)
                 .await
                 .expect("a cold shard is not an error when opted in");
 
