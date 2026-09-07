@@ -89,7 +89,7 @@ impl SubdirClient for LocalSubdirClient {
         // format here and let `SubdirData::get_or_fetch_package_records`
         // filter per query.
         let load_records =
-            move || match sparse_repodata.load_records(&name, PackageFormatSelection::Both) {
+            move || match sparse_repodata.load_records(&name, PackageFormatSelection::PreferCondaWithWhl) {
                 Ok(records) => {
                     let (unique_base_deps, unique_extra_deps) = extract_unique_deps_split(&records);
                     Ok(PackageRecords {
@@ -113,7 +113,7 @@ impl SubdirClient for LocalSubdirClient {
     fn package_names(&self) -> Vec<String> {
         let sparse_repodata: Arc<SparseRepoData> = self.sparse.clone();
         sparse_repodata
-            .package_names(PackageFormatSelection::Both)
+            .package_names(PackageFormatSelection::PreferCondaWithWhl)
             .map(std::convert::Into::into)
             .collect()
     }
