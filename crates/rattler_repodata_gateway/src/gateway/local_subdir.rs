@@ -88,21 +88,22 @@ impl SubdirClient for LocalSubdirClient {
         // constructed once up front regardless of the query); load every
         // format here and let `SubdirData::get_or_fetch_package_records`
         // filter per query.
-        let load_records =
-            move || match sparse_repodata.load_records(&name, PackageFormatSelection::PreferCondaWithWhl) {
-                Ok(records) => {
-                    let (unique_base_deps, unique_extra_deps) = extract_unique_deps_split(&records);
-                    Ok(PackageRecords {
-                        records: records.into_iter().map(Arc::new).collect(),
-                        unique_base_deps,
-                        unique_extra_deps,
-                    })
-                }
-                Err(err) => Err(GatewayError::IoError(
-                    "failed to extract repodata records from sparse repodata".to_string(),
-                    err,
-                )),
-            };
+        let load_records = move || match sparse_repodata
+            .load_records(&name, PackageFormatSelection::PreferCondaWithWhl)
+        {
+            Ok(records) => {
+                let (unique_base_deps, unique_extra_deps) = extract_unique_deps_split(&records);
+                Ok(PackageRecords {
+                    records: records.into_iter().map(Arc::new).collect(),
+                    unique_base_deps,
+                    unique_extra_deps,
+                })
+            }
+            Err(err) => Err(GatewayError::IoError(
+                "failed to extract repodata records from sparse repodata".to_string(),
+                err,
+            )),
+        };
 
         #[cfg(target_arch = "wasm32")]
         return load_records();
