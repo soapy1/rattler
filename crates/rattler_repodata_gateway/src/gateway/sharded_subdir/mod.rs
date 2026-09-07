@@ -1,12 +1,11 @@
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use cfg_if::cfg_if;
 use http::StatusCode;
 use rattler_conda_types::{
-    ChannelUrl, PackageRecord, RepoDataRecord, Shard, UrlOrPath, WhlPackageRecord,
-    package::{ArchiveIdentifier, CondaArchiveType, DistArchiveIdentifier, WheelArchiveType},
+    ChannelUrl, RepoDataRecord, Shard, UrlOrPath, WhlPackageRecord,
+    package::{CondaArchiveType, DistArchiveIdentifier, WheelArchiveType},
 };
 use rattler_redaction::Redact;
 use url::Url;
@@ -15,7 +14,6 @@ use crate::{
     GatewayError,
     fetch::FetchRepoDataError,
     gateway::subdir::{PackageRecords, extract_unique_deps_split},
-    sparse::PackageFormatSelection,
 };
 
 /// Returns `true` if the HTTP status indicates that the server does not expose
@@ -88,97 +86,6 @@ async fn decode_zst_bytes_async<R: AsRef<[u8]> + Send + 'static>(
 
     #[cfg(not(target_arch = "wasm32"))]
     simple_spawn_blocking::tokio::run_blocking_task(decode).await
-}
-
-/// A raw, not-yet-converted-to-[`RepoDataRecord`] shard entry. Kept as an enum
-/// (rather than eagerly building a `RepoDataRecord`) so that
-/// [`dedup_by_preference`] can drop the losing variant of a (name, version,
-/// build) group before the more expensive URL/record construction happens.
-enum RawShardRecord {
-    Package(PackageRecord),
-    Whl(WhlPackageRecord),
-}
-
-/// Selects the shard entries relevant to `variant_consolidation`,
-/// deduplicating preferred-format groups (e.g. `.conda` over `.tar.bz2`)
-/// before any [`RepoDataRecord`] is built for a losing candidate.
-fn select_shard_records(
-    shard: Shard,
-    variant_consolidation: PackageFormatSelection,
-) -> impl Iterator<Item = (DistArchiveIdentifier, RawShardRecord)> {
-    let Shard {
-        packages,
-        conda_packages,
-        v3,
-        removed,
-    } = shard;
-
-    let tar_bz2 = itertools::chain(
-        packages,
-        v3.tar_bz2.into_iter().map(|(id, rec)| {
-            (
-                DistArchiveIdentifier::new(id, CondaArchiveType::TarBz2),
-                rec,
-            )
-        }),
-    )
-    .map(|(id, rec)| (id, RawShardRecord::Package(rec)));
-    let conda = itertools::chain(
-        conda_packages,
-        v3.conda
-            .into_iter()
-            .map(|(id, rec)| (DistArchiveIdentifier::new(id, CondaArchiveType::Conda), rec)),
-    )
-    .map(|(id, rec)| (id, RawShardRecord::Package(rec)));
-    let whl = v3.whl.into_iter().map(|(id, rec)| {
-        (
-            DistArchiveIdentifier::new(id, WheelArchiveType::Whl),
-            RawShardRecord::Whl(rec),
-        )
-    });
-
-    let selected: Vec<_> = match variant_consolidation {
-        PackageFormatSelection::OnlyTarBz2 => tar_bz2.collect(),
-        PackageFormatSelection::OnlyConda => conda.collect(),
-        PackageFormatSelection::Both => tar_bz2.chain(conda).collect(),
-        PackageFormatSelection::PreferConda => dedup_by_preference(tar_bz2.chain(conda)),
-        PackageFormatSelection::PreferCondaWithWhl => {
-            dedup_by_preference(tar_bz2.chain(conda).chain(whl))
-        }
-    };
-
-    selected
-        .into_iter()
-        .filter(move |(id, _)| !removed.contains(id))
-}
-
-/// Keeps, for each unique (name, version, build) archive identifier, only the
-/// most-preferred variant, per [`rattler_conda_types::package::DistArchiveType::cmp_preference`]
-/// (`.conda` over `.tar.bz2` over `.whl`). The relative order of the
-/// surviving entries is otherwise preserved.
-fn dedup_by_preference(
-    iter: impl Iterator<Item = (DistArchiveIdentifier, RawShardRecord)>,
-) -> Vec<(DistArchiveIdentifier, RawShardRecord)> {
-    let mut positions: std::collections::HashMap<ArchiveIdentifier, usize> =
-        std::collections::HashMap::new();
-    let mut out: Vec<(DistArchiveIdentifier, RawShardRecord)> = Vec::new();
-    for (id, record) in iter {
-        match positions.entry(id.identifier.clone()) {
-            Entry::Occupied(entry) => {
-                let idx = *entry.get();
-                if id.archive_type.cmp_preference(out[idx].0.archive_type)
-                    == std::cmp::Ordering::Greater
-                {
-                    out[idx] = (id, record);
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(out.len());
-                out.push((id, record));
-            }
-        }
-    }
-    out
 }
 
 async fn parse_records<R: AsRef<[u8]> + Send + 'static>(
@@ -266,27 +173,22 @@ async fn parse_records<R: AsRef<[u8]> + Send + 'static>(
 // Tests are only run on non-wasm targets since they use tokio and axum
 #[cfg(test)]
 mod tests {
-    use super::select_shard_records;
+    use crate::fetch::CacheAction;
     use crate::gateway::error::GatewayError;
     use crate::gateway::subdir::SubdirClient;
-    use crate::{fetch::CacheAction, sparse::PackageFormatSelection};
     use axum::{
         Router,
         body::Body,
         http::{Response, StatusCode},
         routing::get,
     };
-    use rattler_conda_types::{
-        Channel, PackageName, RepodataRevisions, Shard, ShardedRepodata, ShardedSubdirInfo,
-        UrlOrPath, VersionWithSource, WhlPackageRecord,
-        package::{ArchiveIdentifier, CondaArchiveType, DistArchiveIdentifier},
-    };
+    use rattler_conda_types::{Channel, RepodataRevisions, ShardedRepodata, ShardedSubdirInfo};
     use rattler_digest::{Sha256, parse_digest_from_hex};
-    use rstest::rstest;
+
     use std::future::IntoFuture;
     use std::net::SocketAddr;
     use std::path::Path;
-    use std::str::FromStr;
+
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -294,97 +196,7 @@ mod tests {
     use tokio::sync::oneshot;
     use url::Url;
 
-    use super::{PackageRecord, ShardCachePolicy, ShardedSubdir};
-
-    fn test_package_record(name: &str) -> PackageRecord {
-        PackageRecord::new(
-            PackageName::from_str(name).unwrap(),
-            VersionWithSource::from_str("1.0").unwrap(),
-            "0".to_string(),
-        )
-    }
-
-    fn archive_id(name: &str) -> ArchiveIdentifier {
-        ArchiveIdentifier {
-            name: name.to_string(),
-            version: "1.0".to_string(),
-            build_string: "0".to_string(),
-        }
-    }
-
-    /// A package shipped as both `.tar.bz2` and `.conda`: `PreferConda` and
-    /// `PreferCondaWithWhl` must keep only the `.conda` variant, without ever
-    /// needing to build a `RepoDataRecord` for the discarded `.tar.bz2` one.
-    #[rstest]
-    #[case::prefer_conda(PackageFormatSelection::PreferConda)]
-    #[case::prefer_conda_with_whl(PackageFormatSelection::PreferCondaWithWhl)]
-    fn select_shard_records_prefers_conda_over_tar_bz2(#[case] selection: PackageFormatSelection) {
-        let id = archive_id("foo");
-        let mut shard = Shard::default();
-        shard.packages.insert(
-            DistArchiveIdentifier::new(id.clone(), CondaArchiveType::TarBz2),
-            test_package_record("foo"),
-        );
-        shard.conda_packages.insert(
-            DistArchiveIdentifier::new(id.clone(), CondaArchiveType::Conda),
-            test_package_record("foo"),
-        );
-
-        let selected: Vec<_> = select_shard_records(shard, selection).collect();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].0.archive_type, CondaArchiveType::Conda.into());
-    }
-
-    /// `OnlyTarBz2`/`OnlyConda` must only ever surface their own format, even
-    /// when the other is present in the shard.
-    #[rstest]
-    #[case::only_tar_bz2(PackageFormatSelection::OnlyTarBz2, CondaArchiveType::TarBz2)]
-    #[case::only_conda(PackageFormatSelection::OnlyConda, CondaArchiveType::Conda)]
-    fn select_shard_records_only_selects_requested_format(
-        #[case] selection: PackageFormatSelection,
-        #[case] expected: CondaArchiveType,
-    ) {
-        let id = archive_id("foo");
-        let mut shard = Shard::default();
-        shard.packages.insert(
-            DistArchiveIdentifier::new(id.clone(), CondaArchiveType::TarBz2),
-            test_package_record("foo"),
-        );
-        shard.conda_packages.insert(
-            DistArchiveIdentifier::new(id.clone(), CondaArchiveType::Conda),
-            test_package_record("foo"),
-        );
-
-        let selected: Vec<_> = select_shard_records(shard, selection).collect();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].0.archive_type, expected.into());
-    }
-
-    /// `.whl` is only ever considered for `PreferCondaWithWhl`; every other
-    /// selection (including `Both`) must drop it.
-    #[rstest]
-    #[case::only_tar_bz2(PackageFormatSelection::OnlyTarBz2, false)]
-    #[case::only_conda(PackageFormatSelection::OnlyConda, false)]
-    #[case::both(PackageFormatSelection::Both, false)]
-    #[case::prefer_conda(PackageFormatSelection::PreferConda, false)]
-    #[case::prefer_conda_with_whl(PackageFormatSelection::PreferCondaWithWhl, true)]
-    fn select_shard_records_whl_only_for_prefer_conda_with_whl(
-        #[case] selection: PackageFormatSelection,
-        #[case] expect_whl: bool,
-    ) {
-        let id = archive_id("foo");
-        let mut shard = Shard::default();
-        shard.v3.whl.insert(
-            id,
-            WhlPackageRecord {
-                url: UrlOrPath::Path("foo-1.0-0.whl".into()),
-                package_record: test_package_record("foo"),
-            },
-        );
-
-        let selected: Vec<_> = select_shard_records(shard, selection).collect();
-        assert_eq!(selected.len(), usize::from(expect_whl));
-    }
+    use super::{ShardCachePolicy, ShardedSubdir};
 
     /// A mock server that serves a sharded repodata index but returns
     /// configurable responses for shard requests.

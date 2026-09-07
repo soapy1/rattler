@@ -26,6 +26,15 @@ pub trait RepoDataSource: Send + Sync {
     /// This method is called by the gateway when it needs repodata records
     /// for a particular package. The platform parameter indicates which
     /// subdirectory the gateway is querying for.
+    ///
+    /// The gateway caches what it gets back once per package name and then
+    /// narrows it to whatever selection each query asked for, so it always
+    /// requests [`PackageFormatSelection::Both`] here rather than the
+    /// caller's selection. A source is free to return every format it has;
+    /// anything it drops is dropped for every query. One consequence today:
+    /// `.whl` records are not part of `Both`, so a source that returns them
+    /// will not see them surface under
+    /// [`PackageFormatSelection::PreferCondaWithWhl`].
     async fn fetch_package_records(
         &self,
         platform: Platform,
@@ -105,11 +114,13 @@ impl SubdirClient for CustomSourceClient {
         &self,
         name: &PackageName,
         _reporter: Option<&dyn Reporter>,
-        package_format_selection: PackageFormatSelection,
     ) -> Result<PackageRecords, GatewayError> {
+        // The gateway narrows the cached set per query, so ask the source for
+        // as much as it can give. `Both` is the widest selection that keeps
+        // every conda variant; see the note on `RepoDataSource` about `.whl`.
         let records = self
             .source
-            .fetch_package_records(self.platform, name, package_format_selection)
+            .fetch_package_records(self.platform, name, PackageFormatSelection::Both)
             .await?;
         let (unique_base_deps, unique_extra_deps) =
             extract_unique_deps_split(records.iter().map(|r| &**r));

@@ -1960,9 +1960,10 @@ mod test {
 
     /// Filters and, where applicable, deduplicates `records` by `selection`.
     /// A real `RepoDataSource` is expected to honor `package_format_selection`
-    /// itself (the gateway applies no fallback filtering for custom sources),
-    /// so `MockRepoDataSource` implements the same selection contract here to
-    /// exercise it in tests.
+    /// itself, so `MockRepoDataSource` implements the same selection contract
+    /// here to exercise it in tests. The gateway asks a custom source for
+    /// `Both` and narrows the cached result per query, so what a query sees is
+    /// the source's own filtering followed by the gateway's.
     fn filter_by_package_format(
         records: Vec<RepoDataRecord>,
         selection: PackageFormatSelection,

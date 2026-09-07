@@ -430,6 +430,53 @@ impl SparseRepoData {
         )
     }
 
+    /// Returns all the records for the specified package name, in every
+    /// archive format the repodata offers and with no deduplication between
+    /// formats.
+    ///
+    /// The gateway caches this once per package name and applies each query's
+    /// [`PackageFormatSelection`] to the cached set, so nothing a later
+    /// selection might ask for may be dropped here.
+    pub fn load_records_all_formats(
+        &self,
+        package_name: &PackageName,
+    ) -> io::Result<Vec<RepoDataRecord>> {
+        let repo_data = self.inner.borrow_repo_data();
+        let base_url = repo_data.info.as_ref().and_then(|i| i.base_url.as_deref());
+
+        // `Both` already covers the conda formats, legacy and v3 alike.
+        let mut records = parse_records(
+            Some(package_name),
+            &repo_data.packages,
+            &repo_data.conda_packages,
+            &repo_data.v3,
+            PackageFormatSelection::Both,
+            base_url,
+            &self.channel,
+            &self.subdir,
+            self.patch_record_fn,
+            |_| true,
+        )?;
+
+        // Wheels live only under `v3`, so they have no legacy counterpart to
+        // merge with and are parsed straight from that bucket.
+        let whl = add_stripped_filename(
+            find_package_in_slice(&repo_data.v3.whl, Some(package_name), RecordKind::V3Whl),
+            DistArchiveType::from(WheelArchiveType::Whl),
+        )
+        .map(|(filename, raw_json, kind, _)| (filename, raw_json, kind));
+        records.extend(parse_records_raw(
+            whl,
+            base_url,
+            &self.channel,
+            &self.subdir,
+            self.patch_record_fn,
+            |_| true,
+        )?);
+
+        Ok(records)
+    }
+
     /// Returns all the records for the specified package format(s).
     pub fn load_all_records(
         &self,

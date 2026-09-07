@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
 use ahash::HashMap;
-use rattler_conda_types::{ChannelRelations, PackageName, RepoDataRecord, RepodataRevisions};
+use rattler_conda_types::{
+    ChannelRelations, PackageName, RepoDataRecord, RepodataRevisions,
+    package::{ArchiveIdentifier, CondaArchiveType, DistArchiveType},
+};
 
 use super::GatewayError;
 use crate::sparse::empty_repodata_revisions;
 use crate::{Reporter, sparse::PackageFormatSelection};
 use coalesced_map::{CoalescedGetError, CoalescedMap};
+use std::collections::hash_map::Entry;
 
 /// Records for a single package, with precomputed unique dependency strings
 /// split between unconditional (base) deps and per-extra deps.
@@ -79,6 +83,99 @@ pub(crate) fn extract_unique_deps_split<'a>(
     (Arc::from(base), Arc::new(per_extra))
 }
 
+/// Returns whether `archive_type` is a candidate for `selection`, before any
+/// deduplication between formats is applied.
+fn is_candidate(archive_type: DistArchiveType, selection: PackageFormatSelection) -> bool {
+    match selection {
+        PackageFormatSelection::OnlyTarBz2 => {
+            archive_type == DistArchiveType::Conda(CondaArchiveType::TarBz2)
+        }
+        PackageFormatSelection::OnlyConda => {
+            archive_type == DistArchiveType::Conda(CondaArchiveType::Conda)
+        }
+        PackageFormatSelection::Both | PackageFormatSelection::PreferConda => {
+            matches!(archive_type, DistArchiveType::Conda(_))
+        }
+        PackageFormatSelection::PreferCondaWithWhl => true,
+    }
+}
+
+/// Narrows `records` to `selection`, deduplicating preferred-format groups
+/// (`.conda` over `.tar.bz2` over `.whl`) for the `Prefer*` selections.
+///
+/// Only `Arc`s are cloned; the records themselves stay shared with the cached
+/// set they came from.
+fn selected_records(
+    records: &[Arc<RepoDataRecord>],
+    selection: PackageFormatSelection,
+) -> Vec<Arc<RepoDataRecord>> {
+    let candidates = records
+        .iter()
+        .filter(|record| is_candidate(record.identifier.archive_type, selection));
+
+    match selection {
+        PackageFormatSelection::OnlyTarBz2
+        | PackageFormatSelection::OnlyConda
+        | PackageFormatSelection::Both => candidates.cloned().collect(),
+        PackageFormatSelection::PreferConda | PackageFormatSelection::PreferCondaWithWhl => {
+            dedup_by_preference(candidates)
+        }
+    }
+}
+
+/// Keeps, for each unique (name, version, build) archive identifier, only the
+/// most-preferred variant, per
+/// [`rattler_conda_types::package::DistArchiveType::cmp_preference`] (`.conda`
+/// over `.tar.bz2` over `.whl`). The relative order of the surviving entries
+/// is otherwise preserved.
+fn dedup_by_preference<'a>(
+    iter: impl Iterator<Item = &'a Arc<RepoDataRecord>>,
+) -> Vec<Arc<RepoDataRecord>> {
+    let mut positions: std::collections::HashMap<&'a ArchiveIdentifier, usize> =
+        std::collections::HashMap::new();
+    let mut out: Vec<Arc<RepoDataRecord>> = Vec::new();
+    for record in iter {
+        match positions.entry(&record.identifier.identifier) {
+            Entry::Occupied(entry) => {
+                let idx = *entry.get();
+                if record
+                    .identifier
+                    .archive_type
+                    .cmp_preference(out[idx].identifier.archive_type)
+                    == std::cmp::Ordering::Greater
+                {
+                    out[idx] = record.clone();
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(out.len());
+                out.push(record.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Narrows a cached [`PackageRecords`] to `selection`.
+///
+/// The unique dependency strings are derived from whatever survives the
+/// selection, so they stay in step with the records. When the selection drops
+/// nothing the cached set is reused wholesale, which is the common case and
+/// costs only `Arc` clones.
+fn narrow(cached: &PackageRecords, selection: PackageFormatSelection) -> PackageRecords {
+    let records = selected_records(&cached.records, selection);
+    if records.len() == cached.records.len() {
+        return cached.clone();
+    }
+    let (unique_base_deps, unique_extra_deps) =
+        extract_unique_deps_split(records.iter().map(|r| &**r));
+    PackageRecords {
+        records,
+        unique_base_deps,
+        unique_extra_deps,
+    }
+}
+
 pub enum Subdir {
     /// The subdirectory is missing from the channel, it is considered empty.
     NotFound,
@@ -122,7 +219,13 @@ pub struct SubdirData {
     /// The client to use to fetch repodata.
     client: Arc<dyn SubdirClient>,
 
-    /// Previously fetched or currently pending records (with precomputed deps).
+    /// Previously fetched or currently pending records (with precomputed
+    /// deps), in every archive format the client offers.
+    ///
+    /// Clients hand back the unfiltered set so that one fetch per package
+    /// name serves every [`PackageFormatSelection`]; the selection is applied
+    /// on the way out, in
+    /// [`get_or_fetch_package_records`](Self::get_or_fetch_package_records).
     records: CoalescedMap<PackageName, PackageRecords>,
 }
 
@@ -143,7 +246,8 @@ impl SubdirData {
         let client = self.client.clone();
         let name_clone = name.clone();
 
-        self.records
+        let cached = self
+            .records
             .get_or_try_init(name.clone(), || async move {
                 client
                     .fetch_package_records(&name_clone, reporter.as_deref())
@@ -156,7 +260,9 @@ impl SubdirData {
                     "a coalesced request failed".to_string(),
                     std::io::ErrorKind::Other.into(),
                 ),
-            })
+            })?;
+
+        Ok(narrow(&cached, package_format_selection))
     }
 
     /// Fetches the records for `name` without inserting them into the
@@ -169,14 +275,15 @@ impl SubdirData {
         name: &PackageName,
         reporter: Option<&dyn Reporter>,
     ) -> Result<Vec<Arc<RepoDataRecord>>, GatewayError> {
+        // The scan has no selection of its own, and the client now hands back
+        // every archive format, so narrow to the default rather than letting
+        // the same build show up once per format.
+        let selection = PackageFormatSelection::default();
         if let Some(cached) = self.records.get(name) {
-            return Ok(cached.records);
+            return Ok(selected_records(&cached.records, selection));
         }
-        Ok(self
-            .client
-            .fetch_package_records(name, reporter)
-            .await?
-            .records)
+        let records = self.client.fetch_package_records(name, reporter).await?;
+        Ok(selected_records(&records.records, selection))
     }
 
     /// The number of package names currently held in the per-name record
@@ -238,11 +345,126 @@ mod tests {
 
     use rattler_conda_types::{
         NoArchType, PackageRecord, RepoDataRecord, VersionWithSource,
-        package::DistArchiveIdentifier,
+        package::{CondaArchiveType, DistArchiveIdentifier},
     };
+    use rstest::rstest;
+    use std::sync::Arc;
     use url::Url;
 
-    use super::extract_unique_deps_split;
+    use super::{PackageRecords, extract_unique_deps_split, narrow, selected_records};
+    use crate::sparse::PackageFormatSelection;
+
+    /// `foo-1.0-0` in `extension` (e.g. `.conda`), as a subdir client would
+    /// hand it to [`SubdirData`](super::SubdirData).
+    fn variant(extension: &str) -> Arc<RepoDataRecord> {
+        let mut record = make_record("foo", &["bar"], &[]);
+        let file_name = format!("foo-1.0-0{extension}");
+        record.url = Url::parse(&format!("https://example.com/{file_name}")).unwrap();
+        record.identifier = file_name.parse::<DistArchiveIdentifier>().unwrap();
+        Arc::new(record)
+    }
+
+    fn fetched(extensions: &[&str]) -> Vec<Arc<RepoDataRecord>> {
+        extensions.iter().map(|ext| variant(ext)).collect()
+    }
+
+    /// A package shipped as both `.tar.bz2` and `.conda`: the `Prefer*`
+    /// selections keep only the `.conda` variant.
+    #[rstest]
+    #[case::prefer_conda(PackageFormatSelection::PreferConda)]
+    #[case::prefer_conda_with_whl(PackageFormatSelection::PreferCondaWithWhl)]
+    fn selected_records_prefers_conda_over_tar_bz2(#[case] selection: PackageFormatSelection) {
+        let selected = selected_records(&fetched(&[".tar.bz2", ".conda"]), selection);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].identifier.archive_type,
+            CondaArchiveType::Conda.into()
+        );
+    }
+
+    /// `OnlyTarBz2`/`OnlyConda` only ever surface their own format, even when
+    /// the other is present.
+    #[rstest]
+    #[case::only_tar_bz2(PackageFormatSelection::OnlyTarBz2, CondaArchiveType::TarBz2)]
+    #[case::only_conda(PackageFormatSelection::OnlyConda, CondaArchiveType::Conda)]
+    fn selected_records_only_selects_requested_format(
+        #[case] selection: PackageFormatSelection,
+        #[case] expected: CondaArchiveType,
+    ) {
+        let selected = selected_records(&fetched(&[".tar.bz2", ".conda"]), selection);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].identifier.archive_type, expected.into());
+    }
+
+    /// `Both` keeps every conda-family variant, without deduplicating them.
+    #[test]
+    fn selected_records_both_keeps_every_conda_variant() {
+        let selected = selected_records(
+            &fetched(&[".tar.bz2", ".conda"]),
+            PackageFormatSelection::Both,
+        );
+        assert_eq!(selected.len(), 2);
+    }
+
+    /// `.whl` is only ever considered for `PreferCondaWithWhl`; every other
+    /// selection (including `Both`) drops it.
+    #[rstest]
+    #[case::only_tar_bz2(PackageFormatSelection::OnlyTarBz2, false)]
+    #[case::only_conda(PackageFormatSelection::OnlyConda, false)]
+    #[case::both(PackageFormatSelection::Both, false)]
+    #[case::prefer_conda(PackageFormatSelection::PreferConda, false)]
+    #[case::prefer_conda_with_whl(PackageFormatSelection::PreferCondaWithWhl, true)]
+    fn selected_records_whl_only_for_prefer_conda_with_whl(
+        #[case] selection: PackageFormatSelection,
+        #[case] expect_whl: bool,
+    ) {
+        let selected = selected_records(&fetched(&[".whl"]), selection);
+        assert_eq!(selected.len(), usize::from(expect_whl));
+    }
+
+    /// Narrowing recomputes the unique dependency strings from whatever
+    /// survives, so a dep that only the dropped records carried does not leak
+    /// into the result.
+    #[test]
+    fn narrow_recomputes_deps_from_the_surviving_records() {
+        let mut tar_bz2 = make_record("foo", &["only-in-tar-bz2"], &[]);
+        tar_bz2.identifier = "foo-1.0-0.tar.bz2".parse().unwrap();
+        let mut conda = make_record("foo", &["shared"], &[]);
+        conda.identifier = "foo-1.0-0.conda".parse().unwrap();
+
+        let records = vec![Arc::new(tar_bz2), Arc::new(conda)];
+        let (unique_base_deps, unique_extra_deps) =
+            extract_unique_deps_split(records.iter().map(|r| &**r));
+        let cached = PackageRecords {
+            records,
+            unique_base_deps,
+            unique_extra_deps,
+        };
+        assert_eq!(cached.unique_base_deps.len(), 2);
+
+        let narrowed = narrow(&cached, PackageFormatSelection::OnlyConda);
+        assert_eq!(narrowed.records.len(), 1);
+        assert_eq!(&*narrowed.unique_base_deps, &["shared".to_string()]);
+    }
+
+    /// A selection that drops nothing reuses the cached set as-is.
+    #[test]
+    fn narrow_reuses_the_cached_set_when_nothing_is_dropped() {
+        let records = fetched(&[".conda"]);
+        let (unique_base_deps, unique_extra_deps) =
+            extract_unique_deps_split(records.iter().map(|r| &**r));
+        let cached = PackageRecords {
+            records,
+            unique_base_deps,
+            unique_extra_deps,
+        };
+
+        let narrowed = narrow(&cached, PackageFormatSelection::PreferConda);
+        assert!(Arc::ptr_eq(
+            &narrowed.unique_base_deps,
+            &cached.unique_base_deps
+        ));
+    }
 
     fn make_record(name: &str, deps: &[&str], extra_deps: &[(&str, &[&str])]) -> RepoDataRecord {
         let mut extra_depends: BTreeMap<String, Vec<String>> = BTreeMap::new();
