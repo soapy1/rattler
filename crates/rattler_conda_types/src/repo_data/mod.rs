@@ -1751,7 +1751,7 @@ mod test {
             .get(&DistArchiveIdentifier::try_from_filename("foobar-2.0-bla_1.tar.bz2").unwrap())
             .unwrap();
         let package_constrains = repodata
-            .packages
+            .conda_packages
             .get(
                 &DistArchiveIdentifier::try_from_filename("foo-3.0.2-py36h1af98f8_3.conda")
                     .unwrap(),

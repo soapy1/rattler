@@ -549,7 +549,13 @@ macro_rules! solver_backend_tests {
             use rattler_solve::SolverImpl;
 
             let mut records = super::read_repodata(&dummy_channel_json_path());
-            records.push(records[0].clone());
+            // The bar package does not have any .conda package that shadows it
+            // so, duplicate that record.
+            let duplicate_idx = records
+                .iter()
+                .position(|r| r.package_record.name.as_normalized() == "bar")
+                .expect("test fixture should contain package 'bar'");
+            records.push(records[duplicate_idx].clone());
 
             let task = rattler_solve::SolverTask::from_iter([&records]);
 

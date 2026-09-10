@@ -1778,10 +1778,10 @@ mod test {
 
     #[rstest]
     #[case::both(PackageFormatSelection::Both, 29)]
-    #[case::prefer_conda(PackageFormatSelection::PreferConda, 25)]
-    #[case::prefer_conda_with_whl(PackageFormatSelection::PreferCondaWithWhl, 25)]
-    #[case::only_tar_bz2(PackageFormatSelection::OnlyTarBz2, 24)]
-    #[case::only_conda(PackageFormatSelection::OnlyConda, 5)]
+    #[case::prefer_conda(PackageFormatSelection::PreferConda, 24)]
+    #[case::prefer_conda_with_whl(PackageFormatSelection::PreferCondaWithWhl, 24)]
+    #[case::only_tar_bz2(PackageFormatSelection::OnlyTarBz2, 20)]
+    #[case::only_conda(PackageFormatSelection::OnlyConda, 9)]
     fn test_record_count(#[case] variant: PackageFormatSelection, #[case] expected_count: usize) {
         let (channel, platform, path) = dummy_repo_data();
         let sparse = SparseRepoData::from_file(channel, platform, path, None).unwrap();
